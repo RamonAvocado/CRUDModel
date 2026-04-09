@@ -1,127 +1,186 @@
-import types
-import inspect
-from typing import Callable
-from fastapi import APIRouter, Body, Query
+from typing import Callable, Generic, TypeVar
 
-class Crud:
-    def __init__(self, cls, operations = {"Create", "Read", "Update", "Delete"}):
-        self.cls = cls
-        self.operations: set[str] = operations
+from fastapi import APIRouter, HTTPException
+from sqlmodel import SQLModel, Session, select, create_engine
 
-        router_prefix = self._map_naming_convention("/"+cls.__name__)
-        self.router = APIRouter(prefix=router_prefix, tags=[router_prefix])
+T = TypeVar("T", bound=SQLModel)
 
-        for operation in operations:
-            endpoint = self._map_operation_to_endpoint(operation)
-            method = self._function_creator(endpoint=endpoint, operation=operation, cls=self.cls)
 
-            self.router.add_api_route(
-                f"/{operation.lower()}",
-                method,
-                methods=self._map_operation_to_endpoint(operation)
+class Crud(Generic[T]):
+    """Dynamic CRUD router generator for SQLModel classes.
+
+    Usage:
+        crud = Crud(db_url="sqlite:///./gym.db")
+        crud.include_model(Exercise)
+        crud.include_model(Series)
+
+        app.include_router(crud.get_router())
+    """
+
+    def __init__(self, db_url: str):
+        self.models: dict[type, dict] = {}
+        self.router = APIRouter()
+        self._routes: dict[str, Callable] = {}
+        self.engine = create_engine(db_url, echo=True, connect_args={"timeout": 5})
+
+    def include_model(self, model: type) -> APIRouter:
+        """
+        Register a SQLModel class and create CRUD endpoints for it.
+
+        Args:
+            model: A SQLModel class (not an instance)
+
+        Returns:
+            The router with the newly added endpoints
+
+        Example:
+            crud = Crud("sqlite:///./gym.db")
+            router = crud.include_model(Exercise)
+            app.include_router(router, tags=["Exercises"])
+        """
+        # Store model info
+        self.models[model] = {
+            "name": model.__name__,
+            "table_name": model.__tablename__
+            if hasattr(model, "__tablename__")
+            else None,
+        }
+
+        # Create the router for this model
+        model_router = APIRouter(prefix=f"/{model.__name__}")
+
+        route_specs = [
+            ("list", "GET", "", self._create_list_endpoint(model)),
+            ("get", "GET", "/{id}", self._create_get_endpoint(model)),
+            ("create", "POST", "", self._create_create_endpoint(model)),
+            ("update", "PUT", "/{id}", self._create_update_endpoint(model)),
+            ("delete", "DELETE", "/{id}", self._create_delete_endpoint(model)),
+        ]
+
+        for name, http_method, path, endpoint in route_specs:
+            model_router.add_api_route(
+                path,
+                endpoint,
+                methods=[http_method],
+                name=f"{model.__name__.lower()}_{name}",
             )
 
-    def _map_naming_convention(self, name: str, *, convention = "kebab_case"):
-        # TODO: THIS FUNCTION IS NOT IMPLEMENTED
-        return name.lower()
+        # Add to main router
+        self.router.include_router(model_router)
 
-    def _map_operation_to_endpoint_function(self, op):
-        mapping = {
-            "Create": self.router.post,
-            "Read": self.router.get,
-            "Update": self.router.put,
-            "Delete": self.router.delete,
-        }
-        return mapping[op]
-
-    def _map_operation_to_endpoint(self, op:str):
-        mapping = {
-            "Create": {"POST"},
-            "Read": {"GET"},
-            "Update": {"PUT"},
-            "Delete": {"DELETE"},
-        }
-        return mapping[op]
-
-    def _function_creator(self, endpoint: set, operation, cls):
-        def handler() -> Callable:
-            print(endpoint)
-
-            if "POST" in endpoint:
-                return self._create_endpoint(cls, operation)
-            elif "GET" in endpoint:
-                return self._read_endpoint(cls, operation)
-            elif "PUT" in endpoint:
-                return self._update_endpoint(cls, operation)
-            elif "DELETE" in endpoint:
-                return self._delete_endpoint(cls, operation)
-            else:
-                return self._read_endpoint(cls, operation)
-
-        return handler()
-
-    def _extracting_annotations_from_cls(self, cls:type):
-        annotations = cls.__annotations__
-        if not annotations:
-            # When defining the class with __init__
-            signature_parameters = inspect.signature(cls.__init__).parameters
-            annotations = signature_parameters.copy()
-            annotations.pop("self")
-
-        return annotations
-
-    def _create_endpoint(self, cls, function_name) -> Callable:
-        return self._default_endpoint(cls, function_name, Body)
-
-    def _read_endpoint(self, cls, function_name) -> Callable:
-        return self._default_endpoint(cls, function_name, Query)
-
-    def _update_endpoint(self, cls, function_name):
-        return self._default_endpoint(cls, function_name, Body)
-
-    def _delete_endpoint(self, id: int, function_name):
-        return self._create_function()
-
-    def _default_endpoint(self, cls: type, function_name:str,  fastapi_callable: Callable):
-        annotations = self._extracting_annotations_from_cls(cls)
-
-        parameters = []
-        env = {}
-        for p, meta in annotations.items():
-            item_type = meta.annotation
-            env[f"__t_{p}"] = item_type
-            env[f"__d_{p}"] = fastapi_callable(...)
-            parameters.append(f"{p}:__t_{p} = __d_{p}")
-
-        sig =", ".join(parameters)
-        src = self._create_function_str(name=function_name, sig=sig) 
-        ns = {}
-        exec(src, env, ns)
-        print(ns)
-        return ns[function_name]
-
-    def _create_code(self, a):
-        print("HELLO")
-        return {"Test"}
-
-    def _create_function(self):
-        func = types.FunctionType(
-            self._create_code.__code__,
-            {"__builtins__": __builtins__},
-            # name="NEWEIRD",
-            # argdefs=(),
-            # closure=None
-        )
-        return func
-
-    def _create_function_str(self, name, sig):
-        return f"""
-def {name}({sig}):
-    return {"Test"}
-        """
-
-
-    def get_router(self):
         return self.router
 
-    
+    def _create_list_endpoint(self, model: type):
+        """Create GET /{model} - list all records endpoint."""
+
+        async def handler(limit: int = 100, offset: int = 0):
+            """List all records with pagination."""
+            with Session(self.engine) as session:
+                statement = select(model).offset(offset).limit(limit)
+                return session.exec(statement).all()
+
+        return handler
+
+    def _create_get_endpoint(self, model: type):
+        """Create GET /{model}/{id} - get single record endpoint."""
+        model_name = model.__name__
+
+        def handler(id: int):
+            """Get a single record by id."""
+            with Session(self.engine) as session:
+                result = session.get(model, id)
+                if result is None:
+                    raise HTTPException(
+                        status_code=404, detail=f"{model_name} not found"
+                    )
+                return result
+
+        return handler
+
+    def _create_create_endpoint(self, model: type):
+        """Create POST /{model} - create new record endpoint."""
+
+        def handler(model_data: dict):
+            """Create a new record."""
+            # Convert dict to model instance
+            kwargs = {
+                k: v
+                for k, v in model_data.items()
+                if k in model.model_fields and k != "id"
+            }
+            new_record = model(**kwargs)
+
+            with Session(self.engine) as session:
+                session.add(new_record)
+                session.commit()
+                session.refresh(new_record)
+                return new_record
+
+        return handler
+
+    def _create_update_endpoint(self, model: type):
+        """Create PUT /{model}/{id} - update record endpoint."""
+        model_name = model.__name__
+
+        def handler(id: int, model_data: dict):
+            """Update a record."""
+            with Session(self.engine) as session:
+                record = session.get(model, id)
+                if record is None:
+                    raise HTTPException(
+                        status_code=404, detail=f"{model_name} not found"
+                    )
+
+                # Update fields
+                for key, value in model_data.items():
+                    if key in model.model_fields and key != "id":
+                        setattr(record, key, value)
+
+                session.add(record)
+                session.commit()
+                session.refresh(record)
+                return record
+
+        return handler
+
+    def _create_delete_endpoint(self, model: type):
+        """Create DELETE /{model}/{id} - delete record endpoint."""
+        model_name = model.__name__
+
+        def handler(id: int):
+            """Delete a record."""
+            with Session(self.engine) as session:
+                record = session.get(model, id)
+                if record is None:
+                    raise HTTPException(
+                        status_code=404, detail=f"{model_name} not found"
+                    )
+
+                session.delete(record)
+                session.commit()
+                return {"message": f"{model_name} deleted successfully"}
+
+        return handler
+
+    def get_router(self) -> APIRouter:
+        """
+        Get the router with all registered CRUD endpoints.
+
+        Returns:
+            APIRouter with all CRUD endpoints for registered models
+        """
+        return self.router
+
+    def include_all(self, *models: type) -> APIRouter:
+        """
+        Include multiple models at once.
+
+        Args:
+            *models: SQLModel classes to register
+
+        Returns:
+            The router with all CRUD endpoints
+        """
+        for model in models:
+            self.include_model(model)
+        return self.router
