@@ -1,1 +1,3 @@
-# CRUD_ui
+# CRUDModel
+
+Easily make operations with you SQLModels

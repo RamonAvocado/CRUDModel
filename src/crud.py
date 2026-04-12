@@ -33,6 +33,7 @@ class Crud(Generic[T]):
         Returns:
             The router with the newly added endpoints
 
+
         Example:
             crud = Crud("sqlite:///./gym.db")
             router = crud.include_model(Exercise)

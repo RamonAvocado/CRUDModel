@@ -1,7 +1,7 @@
 [project]
-name = "crud-ui"
+name = "CRUDModel"
 version = "0.1.0"
-description = "Add your description here"
+description = "Easily make operations with you SQLModels"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
